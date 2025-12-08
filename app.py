@@ -10,6 +10,9 @@ import base64
 from io import BytesIO
 from pathlib import Path
 import requests  # For direct API testing
+import win32gui
+import win32process
+import psutil
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QTextEdit, QLabel, QSystemTrayIcon, 
@@ -30,7 +33,7 @@ load_dotenv()
 # Constants
 DEFAULT_INTERVAL = 60
 DEFAULT_THRESHOLD = 10
-IMAGE_SIZE = (512, 512)
+MAX_IMAGE_DIM = (1024, 1024)
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -41,6 +44,32 @@ KEY_MODEL = "model_name"
 KEY_INTERVAL = "interval"
 KEY_DEBUG = "debug_mode"
 KEY_MONITOR_INDEX = "monitor_index"
+KEY_REPORT_API_KEY = "report_api_key"
+KEY_REPORT_BASE_URL = "report_base_url"
+KEY_REPORT_MODEL = "report_model"
+
+def get_active_window_info():
+    """获取当前活动窗口的标题和进程信息"""
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        window_title = win32gui.GetWindowText(hwnd)
+        
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        try:
+            process = psutil.Process(pid)
+            process_name = process.name()
+        except:
+            process_name = "Unknown"
+        
+        return {
+            "title": window_title if window_title else "Unknown",
+            "process": process_name
+        }
+    except Exception as e:
+        return {
+            "title": "获取失败",
+            "process": "Unknown"
+        }
 
 class LogManager:
     """Helper to manage logs being sent to UI"""
@@ -102,13 +131,48 @@ class SettingsDialog(QDialog):
         api_group.setLayout(form_layout)
         layout.addWidget(api_group)
 
-        # Test Button
-        test_btn = QPushButton("测试 API 连接 (纯文本)")
-        test_btn.clicked.connect(self.test_connection)
+        # Report Model Config
+        report_group = QGroupBox("日报生成模型配置 (可选)")
+        report_layout = QFormLayout()
+
+        self.report_base_url_input = QLineEdit()
+        self.report_base_url_input.setText(self.settings.value(KEY_REPORT_BASE_URL, ""))
+        self.report_base_url_input.setPlaceholderText("留空则使用上方配置")
+        report_layout.addRow("Report Base URL:", self.report_base_url_input)
+
+        self.report_api_key_input = QLineEdit()
+        self.report_api_key_input.setText(self.settings.value(KEY_REPORT_API_KEY, ""))
+        self.report_api_key_input.setEchoMode(QLineEdit.Password)
+        self.report_api_key_input.setPlaceholderText("留空则使用上方配置")
+        report_layout.addRow("Report API Key:", self.report_api_key_input)
+
+        self.report_model_input = QComboBox()
+        self.report_model_input.setEditable(True)
+        report_models = [
+            "gemini-2.0-flash-exp",
+            "gemini-1.5-flash",
+            "gpt-4o",
+            "claude-3-5-sonnet-20241022"
+        ]
+        self.report_model_input.addItems(report_models)
+        self.report_model_input.setCurrentText(self.settings.value(KEY_REPORT_MODEL, "gemini-2.0-flash-exp"))
+        report_layout.addRow("Report Model:", self.report_model_input)
+        
+        # Report Model Test Button
+        report_test_btn = QPushButton("测试日报模型连接")
+        report_test_btn.clicked.connect(self.test_report_connection)
+        report_layout.addRow("", report_test_btn)
+        
+        report_group.setLayout(report_layout)
+        layout.addWidget(report_group)
+
+        # Test Button - Changed to Screenshot Test
+        test_btn = QPushButton("📸 立即截图测试 - 查看AI能识别多少信息")
+        test_btn.clicked.connect(self.test_screenshot_analysis)
         layout.addWidget(test_btn)
         
         self.test_result_area = QTextEdit()
-        self.test_result_area.setMaximumHeight(80)
+        self.test_result_area.setMaximumHeight(150)
         self.test_result_area.setReadOnly(True)
         layout.addWidget(self.test_result_area)
 
@@ -153,10 +217,87 @@ class SettingsDialog(QDialog):
         
         self.setLayout(layout)
 
+    def test_screenshot_analysis(self):
+        """立即截图并测试AI能识别多少信息"""
+        api_key = self.api_key_input.text()
+        base_url = self.base_url_input.text().rstrip('/')
+        model = self.model_input.currentText()
+        
+        if not api_key:
+            self.test_result_area.setText("错误: 请先输入 API Key")
+            return
+
+        self.test_result_area.setText("正在截图并分析,请稍候...")
+        QApplication.processEvents()
+
+        try:
+            # 获取当前监控的显示器索引
+            monitor_idx = int(self.settings.value(KEY_MONITOR_INDEX, 1))
+            
+            # 截图
+            with mss.mss() as sct:
+                if monitor_idx >= len(sct.monitors):
+                    monitor_idx = 1
+                monitor = sct.monitors[monitor_idx]
+                sct_img = sct.grab(monitor)
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                img.thumbnail(MAX_IMAGE_DIM, Image.Resampling.LANCZOS)
+            
+            # 获取窗口信息
+            window_info = get_active_window_info()
+            
+            # 编码图片
+            buffered = BytesIO()
+            img.save(buffered, format="JPEG")
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            
+            # 构建详细分析的Prompt
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""请尽可能详细地描述这张屏幕截图中的所有内容。
+
+当前窗口信息: {window_info['title']} ({window_info['process']})
+
+请列出你能看到的:
+1. **主要应用/界面**: 是什么软件?布局如何?
+2. **文本内容**: 能识别的标题、段落、代码、命令等(尽可能多)
+3. **UI元素**: 按钮、菜单、选项卡、输入框等
+4. **视觉细节**: 颜色、图标、布局风格
+5. **用户正在做什么**: 推测具体活动
+6. **其他细节**: 任何你能观察到的信息
+
+请用中文详细描述,不要遗漏细节。"""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_str}",
+                            }
+                        },
+                    ],
+                }
+            ]
+            
+            # 调用API
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=500,  # 增加token限制以获取更详细的描述
+            )
+            
+            result = response.choices[0].message.content
+            self.test_result_area.setText(f"✅ 分析成功!\n\n{result}")
+            
+        except Exception as e:
+            self.test_result_area.setText(f"❌ 测试失败:\n{str(e)}")
+
     def test_connection(self):
-        """
-        Runs the minimal unit test as requested by user using 'requests'.
-        """
+        """保留原有的纯文本API测试功能(备用)"""
         url = self.base_url_input.text().rstrip('/') + "/chat/completions"
         api_key = self.api_key_input.text()
         model = self.model_input.currentText()
@@ -181,8 +322,6 @@ class SettingsDialog(QDialog):
             "n": 1
         }
         
-        # Add some specific SiliconFlow params if needed, but keep it simple for connectivity test
-        
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
@@ -191,11 +330,57 @@ class SettingsDialog(QDialog):
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=10)
             if response.status_code == 200:
-                self.test_result_area.setText(f"成功!\n{response.text[:200]}...") # Show first 200 chars
+                self.test_result_area.setText(f"成功!\n{response.text[:200]}...")
             else:
                 self.test_result_area.setText(f"失败 (Code {response.status_code}):\n{response.text}")
         except Exception as e:
             self.test_result_area.setText(f"请求异常:\n{str(e)}")
+
+    def test_report_connection(self):
+        """测试日报生成模型的连接"""
+        # 使用日报模型配置，如果为空则fallback到主配置
+        api_key = self.report_api_key_input.text() or self.api_key_input.text()
+        base_url = self.report_base_url_input.text() or self.base_url_input.text()
+        model = self.report_model_input.currentText()
+        
+        if not api_key:
+            QMessageBox.warning(self, "错误", "请先配置 API Key（主配置或日报配置）")
+            return
+        
+        if not base_url:
+            QMessageBox.warning(self, "错误", "请先配置 Base URL（主配置或日报配置）")
+            return
+
+        try:
+            self.test_result_area.setText("正在测试日报模型连接...")
+            QApplication.processEvents()
+            
+            url = base_url.rstrip('/') + "/chat/completions"
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "请用一句话介绍你自己。"
+                    }
+                ],
+                "stream": False,
+                "max_tokens": 50,
+                "n": 1
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(url, json=payload, headers=headers, timeout=10)
+            if response.status_code == 200:
+                self.test_result_area.setText(f"✅ 日报模型连接成功!\n模型: {model}\n响应: {response.text[:150]}...")
+            else:
+                self.test_result_area.setText(f"❌ 连接失败 (Code {response.status_code}):\n{response.text[:200]}")
+        except Exception as e:
+            self.test_result_area.setText(f"❌ 测试失败:\n{str(e)}")
 
     def save_settings(self):
         self.settings.setValue(KEY_BASE_URL, self.base_url_input.text())
@@ -205,6 +390,10 @@ class SettingsDialog(QDialog):
         
         selected_monitor_idx = self.monitor_combo.currentData()
         self.settings.setValue(KEY_MONITOR_INDEX, selected_monitor_idx)
+        
+        self.settings.setValue(KEY_REPORT_BASE_URL, self.report_base_url_input.text())
+        self.settings.setValue(KEY_REPORT_API_KEY, self.report_api_key_input.text())
+        self.settings.setValue(KEY_REPORT_MODEL, self.report_model_input.currentText())
         
         self.accept()
 
@@ -252,7 +441,7 @@ class MonitorWorker(QThread):
                 self.logger.debug(traceback.format_exc())
             
             # Wait loop
-            interval = int(self.settings.value(KEY_INTERVAL, DEFAULT_INTERVAL)) # Update interval dynmically
+            interval = int(self.settings.value(KEY_INTERVAL, DEFAULT_INTERVAL))
             for _ in range(interval):
                 if not self.running:
                     break
@@ -270,7 +459,6 @@ class MonitorWorker(QThread):
         # 1. Capture
         monitor_idx = int(self.settings.value(KEY_MONITOR_INDEX, 1))
         try:
-            # Validate index
             if monitor_idx >= len(self.sct.monitors):
                 self.logger.error(f"显示器索引 {monitor_idx} 超出范围，重置为 1")
                 monitor_idx = 1
@@ -278,12 +466,21 @@ class MonitorWorker(QThread):
             start_time = time.time()
             monitor = self.sct.monitors[monitor_idx]
             sct_img = self.sct.grab(monitor)
+            
+            # Convert to PIL Image
             img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-            img = img.resize(IMAGE_SIZE)
-            self.logger.debug(f"截图完成 (Monitor {monitor_idx}). 耗时: {time.time() - start_time:.2f}s")
+            
+            # Resize (Thumbnail - Keep Aspect Ratio)
+            img.thumbnail(MAX_IMAGE_DIM, Image.Resampling.LANCZOS)
+            
+            self.logger.debug(f"截图预处理完成. 尺寸: {img.size} 耗时: {time.time() - start_time:.2f}s")
         except Exception as e:
             self.logger.error(f"截图失败: {e}")
             return
+        
+        # 1.5 Get active window info
+        window_info = get_active_window_info()
+        self.logger.debug(f"活动窗口: {window_info['title']} ({window_info['process']})")
 
         # 2. Local Diff
         is_static = False
@@ -309,7 +506,7 @@ class MonitorWorker(QThread):
             else:
                 self.logger.info("画面变化，正在分析...")
                 try:
-                    activity = self._analyze_image_with_ai(img)
+                    activity = self._analyze_image_with_ai(img, window_info)
                     is_api_call = True
                     self.logger.info(f"识别结果: {activity}")
                 except Exception as e:
@@ -322,6 +519,8 @@ class MonitorWorker(QThread):
         log_entry = {
             "timestamp": timestamp,
             "activity": activity,
+            "window_title": window_info['title'],
+            "process": window_info['process'],
             "is_api_call": is_api_call
         }
         self._save_log(log_entry)
@@ -334,7 +533,7 @@ class MonitorWorker(QThread):
         rms = math.sqrt(np.mean(diff**2))
         return rms
 
-    def _analyze_image_with_ai(self, img):
+    def _analyze_image_with_ai(self, img, window_info):
         model_name = self.settings.value(KEY_MODEL, "Qwen/Qwen2.5-VL-72B-Instruct")
         self.logger.debug(f"调用 AI 模型: {model_name}")
         
@@ -342,13 +541,37 @@ class MonitorWorker(QThread):
         img.save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
-        self.logger.debug("图片已编码，发送请求...")
+        self.logger.debug("图片已编码,发送请求...")
         
+        # 构建提示词 - 让AI专注于内容而非窗口信息
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "用5-10个字简短描述屏幕上正在进行的主要任务（例如：编写Python代码、浏览B站视频、空闲待机）。"},
+                    {
+                        "type": "text", 
+                        "text": f"""分析屏幕截图,用20-50字详细描述用户正在做什么。**不要重复窗口标题信息**。
+
+参考信息(已知): 窗口 {window_info['title']} - {window_info['process']}
+
+**你需要识别的是屏幕内容本身**,例如:
+- 代码编辑器: 识别正在编写的函数名/功能/代码逻辑(如"实现用户登录验证逻辑,包含密码加密和Session管理")
+- 浏览器: 识别网页主要内容/URL/关键信息(如"阅读PyTorch官方教程-卷积神经网络章节,学习CNN架构")
+- 文档/笔记: 识别正在写的主题/关键词/核心内容(如"整理机器学习笔记-梯度下降算法原理及实现")
+- 聊天软件: 识别对话主题和关键内容(如"讨论项目需求-用户权限管理模块设计")
+
+**输出格式**: [动作] - [具体内容/主题]
+**要求**: 尽可能提取屏幕中的关键信息、文件名、函数名、主题词等,20-50字
+
+**示例**:
+- 编写代码 - 实现窗口信息捕获功能,使用win32gui获取前台窗口
+- 阅读文档 - OpenAI Vision API使用说明,学习图像分析参数
+- 调试程序 - 修复截图保存bug,检查文件路径和权限问题
+- 浏览网页 - GitHub开源项目研究,Star数10k+的深度学习框架
+- 编辑笔记 - 深度学习知识点总结,反向传播算法推导过程
+
+**禁止**: 不要输出应用名称、进程名(这些已知)"""
+                    },
                     {
                         "type": "image_url",
                         "image_url": {
@@ -362,7 +585,7 @@ class MonitorWorker(QThread):
         response = self.client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_tokens=30,
+            max_tokens=80,  # 增加到80以支持50字中文输出
         )
         return response.choices[0].message.content.strip()
 
@@ -428,6 +651,12 @@ class AppWindow(QWidget):
         self.report_btn.clicked.connect(self.generate_report)
         self.report_btn.setMinimumHeight(40)
         btn_layout.addWidget(self.report_btn)
+        
+        self.copy_log_btn = QPushButton("复制日志+Prompt")
+        self.copy_log_btn.clicked.connect(self.copy_log_with_prompt)
+        self.copy_log_btn.setMinimumHeight(40)
+        btn_layout.addWidget(self.copy_log_btn)
+        
         layout.addLayout(btn_layout)
 
         # Debug Toggle
@@ -514,10 +743,10 @@ class AppWindow(QWidget):
             self.status_label.setStyleSheet("color: gray; font-weight: bold;")
 
     def generate_report(self):
-        # ... logic similar to before, but read api key from settings ...
-        api_key = self.settings.value(KEY_API_KEY)
-        base_url = self.settings.value(KEY_BASE_URL, "https://api.siliconflow.cn/v1")
-        model = self.settings.value(KEY_MODEL, "Qwen/Qwen2.5-VL-72B-Instruct")
+        # Use separate model config for report generation
+        api_key = self.settings.value(KEY_REPORT_API_KEY) or self.settings.value(KEY_API_KEY)
+        base_url = self.settings.value(KEY_REPORT_BASE_URL) or self.settings.value(KEY_BASE_URL, "https://api.siliconflow.cn/v1")
+        model = self.settings.value(KEY_REPORT_MODEL, "gemini-2.0-flash-exp")
         
         if not api_key:
             QMessageBox.warning(self, "错误", "API Key 未配置")
@@ -541,7 +770,8 @@ class AppWindow(QWidget):
             
         context = ""
         for log in logs:
-            context += f"[{log['timestamp']}] {log['activity']}\n"
+            window_info = f" ({log.get('window_title', 'Unknown')})"
+            context += f"[{log['timestamp']}] {log['activity']}{window_info}\n"
             
         try:
             self.log_display.append("[INFO] 正在生成日报...")
@@ -553,7 +783,29 @@ class AppWindow(QWidget):
                 messages=[
                     {
                         "role": "user",
-                        "content": f"请根据以下用户今日的活动日志，生成一份日报摘要：\n{context}"
+                        "content": f"""请根据以下用户今日的活动日志，生成一份结构化的日报。
+
+原始日志：
+{context}
+
+输出要求：
+1. 使用时间轴格式，而非段落叙述
+2. 格式：**HH:MM - HH:MM**: 活动描述
+3. 合并连续的相似活动
+4. 突出重点项目和成果
+5. 最后添加一句总结
+
+示例格式：
+## 📅 今日活动时间轴
+
+**09:00 - 10:30**: 开发 LumosLog 项目 - 实现窗口信息捕获功能
+**10:30 - 11:00**: 查阅 Python pywin32 官方文档
+**11:00 - 12:00**: 编写代码测试与调试
+...
+
+---
+💡 **今日总结**: ...
+"""
                     }
                 ]
             )
@@ -565,6 +817,68 @@ class AppWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "生成失败", str(e))
             self.log_display.append(f"[ERROR] 生成失败: {str(e)}")
+
+    def copy_log_with_prompt(self):
+        """复制结构化日志和提示词到剪贴板"""
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        filename = LOG_DIR / f"daily_log_{date_str}.jsonl"
+        
+        if not filename.exists():
+            QMessageBox.information(self, "提示", "今日暂无日志数据。")
+            return
+
+        logs = []
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                logs.append(json.loads(line))
+        
+        if not logs:
+            QMessageBox.information(self, "提示", "日志数据为空。")
+            return
+        
+        # 构建结构化日志
+        structured_log = f"# {date_str} 活动日志\n\n"
+        for log in logs:
+            timestamp = log['timestamp']
+            activity = log['activity']
+            window = log.get('window_title', 'Unknown')
+            process = log.get('process', 'Unknown')
+            structured_log += f"**[{timestamp}]** {activity}\n"
+            structured_log += f"  - 窗口: {window}\n"
+            structured_log += f"  - 应用: {process}\n\n"
+        
+        # 添加提示词模板
+        prompt_template = """
+
+---
+
+**请根据以上日志，生成一份结构化的工作日报。要求：**
+
+1. 使用时间轴格式：**HH:MM - HH:MM**: 活动描述
+2. 合并连续的相似活动
+3. 突出重点项目和成果
+4. 最后添加一句总结
+
+示例格式：
+## 📅 今日活动时间轴
+
+**09:00 - 10:30**: 开发 XXX 项目 - 实现 YYY 功能
+**10:30 - 11:00**: 查阅技术文档
+...
+
+---
+💡 **今日总结**: ...
+"""
+        
+        full_text = structured_log + prompt_template
+        
+        # 复制到剪贴板
+        clipboard = QApplication.clipboard()
+        clipboard.setText(full_text)
+        
+        QMessageBox.information(self, "成功", f"已复制 {len(logs)} 条日志和提示词到剪贴板！\n可直接粘贴到 AI 对话框。")
+        self.log_display.append(f"[INFO] 已复制日志到剪贴板 ({len(logs)} 条)")
+
 
     def closeEvent(self, event: QCloseEvent):
         if self.tray_icon.isVisible():

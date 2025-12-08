@@ -5,3 +5,5 @@ Pillow
 openai
 python-dotenv
 numpy
+pywin32
+psutil

@@ -1,3 +1,10 @@
 {"timestamp": "22:50:43", "activity": "AI 分析失败: Request timed out.", "is_api_call": false}
 {"timestamp": "22:55:31", "activity": "使用Total Commander文件管理器。", "is_api_call": true}
 {"timestamp": "22:59:17", "activity": "编写Python代码。", "is_api_call": true}
+{"timestamp": "23:16:34", "activity": "编写Python代码", "is_api_call": true}
+{"timestamp": "23:17:36", "activity": "查看API文档和代码。", "is_api_call": true}
+{"timestamp": "23:38:44", "activity": "编程 - 编辑app.py文件，运行LumosLog项目 (VSCode)", "window_title": "LumosLog - AI Screen Logger", "process": "python.exe", "is_api_call": true}
+{"timestamp": "23:39:36", "activity": "编程 - 查阅文档 - 硅基流动 API文档 (嵌入请求)", "window_title": "LumosLog - AI Screen Logger", "process": "python.exe", "is_api_call": true}
+{"timestamp": "23:40:09", "activity": "- 编辑笔记 - 2025-12-07 日记 (Obsidian)", "window_title": "2025-12-07 - @蒺藜 - Obsidian v1.10.6", "process": "Obsidian.exe", "is_api_call": true}
+{"timestamp": "23:49:14", "activity": "编写代码 - 实现屏幕日志处理及GPT接口日志生成", "window_title": "LumosLog - AI Screen Logger", "process": "python.exe", "is_api_call": true}
+{"timestamp": "23:50:28", "activity": "浏览内容 - 观看视频推荐列表，涵盖科技、娱乐和生活等多个热门主题，如AI时代就业趋势和双肩包横评。", "window_title": "LumosLog - AI Screen Logger", "process": "python.exe", "is_api_call": true}
