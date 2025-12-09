@@ -1167,6 +1167,103 @@ class AppWindow(QWidget):
             self.toggle_btn.setText("开始监控")
             self.status_label.setText("状态: 待机")
             self.status_label.setStyleSheet("color: gray; font-weight: bold;")
+    
+    def compress_logs(self, logs):
+        """智能压缩日志,过滤和合并相似活动,减少token消耗"""
+        if not logs:
+            return []
+        
+        compressed = []
+        
+        # 第一步: 过滤掉"同上(静止)"等无效记录
+        filtered_logs = []
+        for log in logs:
+            activity = log.get('activity', '').strip()
+            # 跳过静止状态或API失败的记录
+            if activity in ['同上 (静止)', 'API Key 缺失', ''] or '分析失败' in activity:
+                continue
+            filtered_logs.append(log)
+        
+        if not filtered_logs:
+            return []
+        
+        # 第二步: 合并连续的相似活动
+        i = 0
+        while i < len(filtered_logs):
+            current = filtered_logs[i]
+            start_time = current['timestamp']
+            end_time = start_time
+            
+            # 向前查找相似活动
+            j = i + 1
+            similar_count = 0
+            while j < len(filtered_logs):
+                next_log = filtered_logs[j]
+                # 判断活动是否相似（窗口相同 + 活动描述相似度高）
+                if (self._is_similar_activity(current, next_log)):
+                    end_time = next_log['timestamp']
+                    similar_count += 1
+                    j += 1
+                else:
+                    break
+            
+            # 创建压缩后的日志条目
+            merged_log = {
+                'timestamp': f"{start_time} - {end_time}" if similar_count > 0 else start_time,
+                'activity': current['activity'],
+                'window_title': current.get('window_title', 'Unknown'),
+                'process': current.get('process', 'Unknown'),
+                'duration_minutes': similar_count # 持续分钟数（粗略估计）
+            }
+            compressed.append(merged_log)
+            
+            i = j if j > i else i + 1
+        
+        # 统计信息
+        filtered_count = len(filtered_logs)
+        skipped_count = len(logs) - filtered_count
+        compression_ratio = len(compressed) / len(logs) * 100 if logs else 0
+        
+        # 详细的调试信息
+        self.log_display.append(f"[INFO] ━━━ 日志压缩统计 ━━━")
+        self.log_display.append(f"[INFO] 原始日志: {len(logs)} 条")
+        self.log_display.append(f"[INFO] 过滤掉静止/无效: {skipped_count} 条")
+        self.log_display.append(f"[INFO] 有效记录: {filtered_count} 条")
+        self.log_display.append(f"[INFO] 合并后: {len(compressed)} 条")
+        self.log_display.append(f"[INFO] 压缩率: {compression_ratio:.1f}% (节省token约 {100-compression_ratio:.1f}%)")
+        self.log_display.append(f"[INFO] ━━━━━━━━━━━━━━━━━━")
+        
+        return compressed
+    
+    def _is_similar_activity(self, log1, log2):
+        """判断两个日志条目是否为相似活动"""
+        # 窗口标题必须相同
+        if log1.get('window_title') != log2.get('window_title'):
+            return False
+        
+        # 进程名必须相同
+        if log1.get('process') != log2.get('process'):
+            return False
+        
+        # 活动描述相似度检查（简单的关键词匹配）
+        act1 = log1.get('activity', '').lower()
+        act2 = log2.get('activity', '').lower()
+        
+        # 提取关键词（去除常见动词）
+        stop_words = {'编写', '阅读', '浏览', '查看', '调试', '编辑', '操作', '配置'}
+        words1 = set(act1.split()) - stop_words
+        words2 = set(act2.split()) - stop_words
+        
+        if not words1 or not words2:
+            return act1 == act2
+        
+        # 计算Jaccard相似度
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        similarity = intersection / union if union > 0 else 0
+        
+        # 相似度阈值设为0.5
+        return similarity >= 0.5
 
     def generate_report(self):
         # Use separate model config for report generation
@@ -1193,11 +1290,24 @@ class AppWindow(QWidget):
         if not logs:
             QMessageBox.information(self, "提示", "日志数据为空。")
             return
+        
+        # 智能压缩日志,减少token消耗
+        self.log_display.append(f"[INFO] 📊 开始生成日报... (原始: {len(logs)} 条)")
+        compressed_logs = self.compress_logs(logs)
+        
+        if not compressed_logs:
+            QMessageBox.information(self, "提示", "压缩后无有效日志数据（可能全是静止状态）。")
+            return
             
-        context = ""
-        for log in logs:
-            window_info = f" ({log.get('window_title', 'Unknown')})"
-            context += f"[{log['timestamp']}] {log['activity']}{window_info}\n"
+        # 构建表格格式的精简日志
+        context = "| 时间 | 窗口 | 应用 | 日志 |\n"
+        context += "| --- | --- | --- | --- |\n"
+        for log in compressed_logs:
+            timestamp = log.get('timestamp', '')
+            window = log.get('window_title', 'Unknown')
+            process = log.get('process', 'Unknown')
+            activity = log.get('activity', '')
+            context += f"| {timestamp} | {window} | {process} | {activity} |\n"
             
         try:
             self.log_display.append("[INFO] 正在生成日报...")
@@ -1211,7 +1321,7 @@ class AppWindow(QWidget):
                         "role": "user",
                         "content": f"""请根据以下用户今日的活动日志，生成一份结构化的日报。
 
-原始日志：
+原始日志（表格格式）：
 {context}
 
 输出要求：
@@ -1262,16 +1372,24 @@ class AppWindow(QWidget):
             QMessageBox.information(self, "提示", "日志数据为空。")
             return
         
-        # 构建结构化日志
+        # 智能压缩日志,减少token消耗
+        self.log_display.append(f"[INFO] 📋 开始复制日志... (原始: {len(logs)} 条)")
+        compressed_logs = self.compress_logs(logs)
+        
+        if not compressed_logs:
+            QMessageBox.information(self, "提示", "压缩后无有效日志数据（可能全是静止状态）。")
+            return
+        
+        # 构建表格格式的精简日志
         structured_log = f"# {date_str} 活动日志\n\n"
-        for log in logs:
-            timestamp = log['timestamp']
-            activity = log['activity']
+        structured_log += "| 时间 | 窗口 | 应用 | 日志 |\n"
+        structured_log += "| --- | --- | --- | --- |\n"
+        for log in compressed_logs:
+            timestamp = log.get('timestamp', '')
             window = log.get('window_title', 'Unknown')
             process = log.get('process', 'Unknown')
-            structured_log += f"**[{timestamp}]** {activity}\n"
-            structured_log += f"  - 窗口: {window}\n"
-            structured_log += f"  - 应用: {process}\n\n"
+            activity = log.get('activity', '')
+            structured_log += f"| {timestamp} | {window} | {process} | {activity} |\n"
         
         # 添加提示词模板
         prompt_template = """
@@ -1302,8 +1420,8 @@ class AppWindow(QWidget):
         clipboard = QApplication.clipboard()
         clipboard.setText(full_text)
         
-        QMessageBox.information(self, "成功", f"已复制 {len(logs)} 条日志和提示词到剪贴板！\n可直接粘贴到 AI 对话框。")
-        self.log_display.append(f"[INFO] 已复制日志到剪贴板 ({len(logs)} 条)")
+        QMessageBox.information(self, "成功", f"已复制日志到剪贴板！\n原始: {len(logs)} 条 → 压缩后: {len(compressed_logs)} 条\n可直接粘贴到 AI 对话框。")
+        self.log_display.append(f"[INFO] 已复制日志到剪贴板 (压缩后 {len(compressed_logs)} 条)")
 
 
     def closeEvent(self, event: QCloseEvent):
