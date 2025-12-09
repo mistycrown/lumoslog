@@ -59,6 +59,7 @@ KEY_REPORT_MODEL = "report_model"
 KEY_RESOLUTION = "resolution_preset"
 KEY_SAVED_PRESETS = "saved_presets"
 KEY_PROVIDER_PRESET = "provider_preset"
+KEY_THRESHOLD = "img_threshold"
 
 RESOLUTION_PRESETS = {
     "低 (512px) - 节省Token": 512,
@@ -216,15 +217,9 @@ class SettingsDialog(QDialog):
         self.model_input = QComboBox()
         self.model_input.setEditable(True)
         models = [
-            "Qwen/Qwen2.5-VL-72B-Instruct",
-            "Qwen/Qwen3-VL-8B-Instruct",
-            "glm-4v-plus",
-            "glm-4v-flash",
-            "glm-4v",
             "glm-4.6v-flash",
-            "glm-4.6v",
-            "gpt-4o-mini",
-            "deepseek-ai/DeepSeek-V3"
+            "glm-4v-flash",
+            "Qwen/Qwen2.5-VL-72B-Instruct",
         ]
         self.model_input.addItems(models)
         self.model_input.setCurrentText(self.settings.value(KEY_MODEL, "Qwen/Qwen2.5-VL-72B-Instruct"))
@@ -290,6 +285,12 @@ class SettingsDialog(QDialog):
         self.interval_input = QLineEdit()
         self.interval_input.setText(str(self.settings.value(KEY_INTERVAL, DEFAULT_INTERVAL)))
         other_layout.addRow("截图间隔 (秒):", self.interval_input)
+        
+        # Threshold Input
+        self.threshold_input = QLineEdit()
+        self.threshold_input.setText(str(self.settings.value(KEY_THRESHOLD, DEFAULT_THRESHOLD)))
+        self.threshold_input.setPlaceholderText("默认: 10 (越小越灵敏)")
+        other_layout.addRow("变化检测阈值:", self.threshold_input)
 
         # Monitor Selection
         self.monitor_combo = QComboBox()
@@ -348,12 +349,10 @@ class SettingsDialog(QDialog):
         self.provider_combo.blockSignals(True)
         self.provider_combo.clear()
         
-        # Default Presets
+        # Default Presets (Simplified)
         self.provider_combo.addItem("自定义 / 其他", "custom")
         self.provider_combo.addItem("SiliconFlow (硅基流动)", "silicon")
         self.provider_combo.addItem("Zhipu AI (智谱)", "zhipu")
-        self.provider_combo.addItem("DeepSeek", "deepseek")
-        self.provider_combo.addItem("OpenAI", "openai")
         
         # User Saved Presets
         saved_presets = self.settings.value(KEY_SAVED_PRESETS, {})
@@ -599,7 +598,9 @@ class SettingsDialog(QDialog):
         self.settings.setValue(KEY_BASE_URL, self.base_url_input.text())
         self.settings.setValue(KEY_API_KEY, self.api_key_input.text())
         self.settings.setValue(KEY_MODEL, self.model_input.currentText())
+        self.settings.setValue(KEY_MODEL, self.model_input.currentText())
         self.settings.setValue(KEY_INTERVAL, self.interval_input.text())
+        self.settings.setValue(KEY_THRESHOLD, self.threshold_input.text())
         
         selected_monitor_idx = self.monitor_combo.currentData()
         self.settings.setValue(KEY_MONITOR_INDEX, selected_monitor_idx)
@@ -755,8 +756,9 @@ class MonitorWorker(QThread):
                 is_static = False
             else:
                 diff_val = self._calculate_rms(self.last_image, img)
-                self.logger.debug(f"图像差异 RMS: {diff_val:.2f} (阈值: {DEFAULT_THRESHOLD})")
-                if diff_val < DEFAULT_THRESHOLD:
+                threshold = int(self.settings.value(KEY_THRESHOLD, DEFAULT_THRESHOLD))
+                self.logger.debug(f"图像差异 RMS: {diff_val:.2f} (阈值: {threshold})")
+                if diff_val < threshold:
                     is_static = True
         else:
             self.logger.debug("首张图片，跳过对比")
