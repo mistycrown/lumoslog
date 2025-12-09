@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 import time
 import json
 import datetime
@@ -12,14 +13,18 @@ from pathlib import Path
 import requests  # For direct API testing
 import win32gui
 import win32process
+import win32api
+import win32con
 import psutil
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QTextEdit, QLabel, QSystemTrayIcon, 
                                QMenu, QMessageBox, QDialog, QSizePolicy, 
-                               QLineEdit, QFormLayout, QComboBox, QCheckBox, QGroupBox)
-from PySide6.QtCore import QThread, Signal, Qt, QTimer, Slot, QSettings
-from PySide6.QtGui import QIcon, QAction, QCloseEvent
+                               QLineEdit, QFormLayout, QComboBox, QCheckBox, QGroupBox,
+                               QListWidget, QListWidgetItem, QScrollArea, QInputDialog)
+
+from PySide6.QtCore import QThread, Signal, Qt, QTimer, Slot, QSettings, QEvent
+from PySide6.QtGui import QIcon, QAction, QCloseEvent, QPixmap
 from qt_material import apply_stylesheet
 import mss
 from PIL import Image, ImageChops
@@ -36,6 +41,10 @@ DEFAULT_THRESHOLD = 10
 MAX_IMAGE_DIM = (1024, 1024)
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
+SCREENSHOT_DIR = Path("screenshots")
+SCREENSHOT_DIR.mkdir(exist_ok=True)
+ICON_PATH = Path("assets/icon.png")
+ICON_PATH.parent.mkdir(exist_ok=True)
 
 # Application Settings Keys
 KEY_API_KEY = "api_key"
@@ -47,6 +56,23 @@ KEY_MONITOR_INDEX = "monitor_index"
 KEY_REPORT_API_KEY = "report_api_key"
 KEY_REPORT_BASE_URL = "report_base_url"
 KEY_REPORT_MODEL = "report_model"
+KEY_RESOLUTION = "resolution_preset"
+KEY_SAVED_PRESETS = "saved_presets"
+KEY_PROVIDER_PRESET = "provider_preset"
+
+RESOLUTION_PRESETS = {
+    "低 (512px) - 节省Token": 512,
+    "中 (1024px) - 默认推荐": 1024,
+    "高 (1536px) - 清晰细节": 1536, 
+    "超高 (2048px) - 最大细节": 2048,
+    "原始分辨率 (不缩放)": 0
+}
+
+def resize_image(img, target_size):
+    """Resize image based on target max dimension while keeping aspect ratio."""
+    if target_size and target_size > 0:
+        img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
+    return img
 
 def get_active_window_info():
     """获取当前活动窗口的标题和进程信息"""
@@ -65,11 +91,57 @@ def get_active_window_info():
             "title": window_title if window_title else "Unknown",
             "process": process_name
         }
-    except Exception as e:
+    except Exception:
         return {
             "title": "获取失败",
             "process": "Unknown"
         }
+
+def get_active_monitor_index(sct, last_index=1):
+    """
+    Determine which monitor contains the center of the active window.
+    Returns the mss monitor index (1-based).
+    Fallback to last_index if failed.
+    """
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return last_index
+
+        # Use Windows API to find the monitor handle for the window
+        monitor_handle = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+        monitor_info = win32api.GetMonitorInfo(monitor_handle)
+        mon_rect = monitor_info['Monitor'] # (left, top, right, bottom)
+        
+        # Match against mss monitors
+        # mss monitors[0] is 'all', 1+ are individual
+        # mss struct: {'left': x, 'top': y, 'width': w, 'height': h}
+        
+        # Windows API rect corresponds to mss coordinates usually
+        # We look for the best overlap or exact match of top-left
+        
+        for i, m in enumerate(sct.monitors):
+            if i == 0: continue
+            
+            # Simple check: does the monitor start at the same point?
+            # This is usually sufficient for standard setups
+            if m['left'] == mon_rect[0] and m['top'] == mon_rect[1]:
+                return i
+                
+        # If no exact match (e.g. DPI scaling diffs), try center point
+        rect = win32gui.GetWindowRect(hwnd)
+        cx = (rect[0] + rect[2]) // 2
+        cy = (rect[1] + rect[3]) // 2
+        
+        for i, m in enumerate(sct.monitors):
+            if i == 0: continue
+            if (m['left'] <= cx < m['left'] + m['width'] and 
+                m['top'] <= cy < m['top'] + m['height']):
+                return i
+
+        return last_index
+    except Exception:
+        return last_index
 
 class LogManager:
     """Helper to manage logs being sent to UI"""
@@ -79,16 +151,21 @@ class LogManager:
 
     def info(self, msg):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.signal.emit(f"[{timestamp}] [INFO] {msg}")
+        log_msg = f"[{timestamp}] [INFO] {msg}"
+        self.signal.emit(log_msg)
+        print(log_msg)
 
     def debug(self, msg):
         if self.debug_mode:
             timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            self.signal.emit(f"[{timestamp}] [DEBUG] {msg}")
+            log_msg = f"[{timestamp}] [DEBUG] {msg}"
+            self.signal.emit(log_msg)
+            print(log_msg)
 
     def error(self, msg):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.signal.emit(f"[{timestamp}] [ERROR] <font color='red'>{msg}</font>")
+        print(f"[{timestamp}] [ERROR] {msg}")
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -99,11 +176,31 @@ class SettingsDialog(QDialog):
         self.init_ui()
 
     def init_ui(self):
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
         
+        # Scroll Area Setup
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content_widget = QWidget()
+        layout = QVBoxLayout(content_widget)
+
         # API Config Group
         api_group = QGroupBox("API 配置")
+        api_group = QGroupBox("API 配置")
         form_layout = QFormLayout()
+
+        # Provider Preset
+        preset_layout = QHBoxLayout()
+        self.provider_combo = QComboBox()
+        self.refresh_presets()
+        self.provider_combo.currentIndexChanged.connect(self.on_provider_changed)
+        preset_layout.addWidget(self.provider_combo)
+        
+        save_preset_btn = QPushButton("保存为预设")
+        save_preset_btn.clicked.connect(self.save_new_preset)
+        preset_layout.addWidget(save_preset_btn)
+        
+        form_layout.addRow("快捷预设:", preset_layout)
 
         self.base_url_input = QLineEdit()
         self.base_url_input.setText(self.settings.value(KEY_BASE_URL, "https://api.siliconflow.cn/v1"))
@@ -121,6 +218,11 @@ class SettingsDialog(QDialog):
         models = [
             "Qwen/Qwen2.5-VL-72B-Instruct",
             "Qwen/Qwen3-VL-8B-Instruct",
+            "glm-4v-plus",
+            "glm-4v-flash",
+            "glm-4v",
+            "glm-4.6v-flash",
+            "glm-4.6v",
             "gpt-4o-mini",
             "deepseek-ai/DeepSeek-V3"
         ]
@@ -175,6 +277,11 @@ class SettingsDialog(QDialog):
         self.test_result_area.setMaximumHeight(150)
         self.test_result_area.setReadOnly(True)
         layout.addWidget(self.test_result_area)
+        
+        # View Full Text Button
+        view_full_btn = QPushButton("查看全文")
+        view_full_btn.clicked.connect(self.view_full_result)
+        layout.addWidget(view_full_btn)
 
         # Other Settings
         other_group = QGroupBox("监控设置")
@@ -186,6 +293,8 @@ class SettingsDialog(QDialog):
 
         # Monitor Selection
         self.monitor_combo = QComboBox()
+        self.monitor_combo.addItem("🔄 自动跟随活动窗口 (推荐)", -1)
+        
         with mss.mss() as sct:
             for i, monitor in enumerate(sct.monitors):
                 if i == 0: continue # Skip 'all in one'
@@ -195,11 +304,25 @@ class SettingsDialog(QDialog):
         # Find index in combobox
         idx_to_set = 0
         for i in range(self.monitor_combo.count()):
-            if self.monitor_combo.itemData(i) == current_idx:
+            if(int(self.monitor_combo.itemData(i)) == current_idx):
                 idx_to_set = i
                 break
         self.monitor_combo.setCurrentIndex(idx_to_set)
         other_layout.addRow("选择显示器:", self.monitor_combo)
+
+        # Resolution Selection
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItems(list(RESOLUTION_PRESETS.keys()))
+        
+        current_res_val = int(self.settings.value(KEY_RESOLUTION, 1024))
+        # Find preset matching value
+        res_text = "中 (1024px) - 默认推荐" # default
+        for k, v in RESOLUTION_PRESETS.items():
+            if v == current_res_val:
+                res_text = k
+                break
+        self.resolution_combo.setCurrentText(res_text)
+        other_layout.addRow("截图清晰度:", self.resolution_combo)
         
         other_group.setLayout(other_layout)
         layout.addWidget(other_group)
@@ -215,7 +338,55 @@ class SettingsDialog(QDialog):
         btn_box.addWidget(cancel_btn)
         layout.addLayout(btn_box)
         
-        self.setLayout(layout)
+        layout.addLayout(btn_box)
+        
+        scroll.setWidget(content_widget)
+        main_layout.addWidget(scroll)
+        self.setLayout(main_layout)
+
+    def refresh_presets(self):
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.clear()
+        
+        # Default Presets
+        self.provider_combo.addItem("自定义 / 其他", "custom")
+        self.provider_combo.addItem("SiliconFlow (硅基流动)", "silicon")
+        self.provider_combo.addItem("Zhipu AI (智谱)", "zhipu")
+        self.provider_combo.addItem("DeepSeek", "deepseek")
+        self.provider_combo.addItem("OpenAI", "openai")
+        
+        # User Saved Presets
+        saved_presets = self.settings.value(KEY_SAVED_PRESETS, {})
+        for name, data in saved_presets.items():
+            self.provider_combo.addItem(f"⭐ {name}", data)
+            
+        self.provider_combo.blockSignals(False)
+
+    def save_new_preset(self):
+        name, ok = QInputDialog.getText(self, "保存预设", "请输入预设名称:")
+        if ok and name:
+            data = {
+                "base_url": self.base_url_input.text(),
+                "api_key": self.api_key_input.text(),
+                "model": self.model_input.currentText()
+            }
+            saved_presets = self.settings.value(KEY_SAVED_PRESETS, {})
+            saved_presets[name] = data
+            self.settings.setValue(KEY_SAVED_PRESETS, saved_presets)
+            
+            QMessageBox.information(self, "成功", f"预设 '{name}' 已保存!")
+            self.refresh_presets()
+            # Select the new one
+            idx = self.provider_combo.findText(f"⭐ {name}")
+            if idx != -1:
+                self.provider_combo.setCurrentIndex(idx)
+
+        # Restore saved preset selection
+        last_preset = self.settings.value(KEY_PROVIDER_PRESET, "")
+        if last_preset:
+             idx = self.provider_combo.findText(last_preset)
+             if idx >= 0:
+                 self.provider_combo.setCurrentIndex(idx)
 
     def test_screenshot_analysis(self):
         """立即截图并测试AI能识别多少信息"""
@@ -223,11 +394,15 @@ class SettingsDialog(QDialog):
         base_url = self.base_url_input.text().rstrip('/')
         model = self.model_input.currentText()
         
+        # Get Resolution from UI (to test effect immediately)
+        res_text = self.resolution_combo.currentText()
+        target_size = RESOLUTION_PRESETS.get(res_text, 1024)
+        
         if not api_key:
             self.test_result_area.setText("错误: 请先输入 API Key")
             return
 
-        self.test_result_area.setText("正在截图并分析,请稍候...")
+        self.test_result_area.setText(f"正在截图 (分辨率: {res_text})...")
         QApplication.processEvents()
 
         try:
@@ -236,20 +411,28 @@ class SettingsDialog(QDialog):
             
             # 截图
             with mss.mss() as sct:
+                 # Auto resolve for test
+                if monitor_idx == -1:
+                    monitor_idx = get_active_monitor_index(sct, 1)
+
                 if monitor_idx >= len(sct.monitors):
                     monitor_idx = 1
                 monitor = sct.monitors[monitor_idx]
                 sct_img = sct.grab(monitor)
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                img.thumbnail(MAX_IMAGE_DIM, Image.Resampling.LANCZOS)
+                
+                # Apply Resolution Setting
+                img = resize_image(img, target_size)
             
             # 获取窗口信息
             window_info = get_active_window_info()
             
             # 编码图片
             buffered = BytesIO()
-            img.save(buffered, format="JPEG")
+            img.save(buffered, format="JPEG", quality=85)
             img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            
+            size_kb = len(img_str) / 1024 * 0.75 # approx
             
             # 构建详细分析的Prompt
             messages = [
@@ -258,19 +441,16 @@ class SettingsDialog(QDialog):
                     "content": [
                         {
                             "type": "text",
-                            "text": f"""请尽可能详细地描述这张屏幕截图中的所有内容。
+                            "text": f"""请详细分析截图中的**文本内容**和**用户行为**。忽略UI布局、颜色、图标等视觉细节。
 
-当前窗口信息: {window_info['title']} ({window_info['process']})
+当前窗口: {window_info['title']} ({window_info['process']})
+图片尺寸: {img.size}
 
-请列出你能看到的:
-1. **主要应用/界面**: 是什么软件?布局如何?
-2. **文本内容**: 能识别的标题、段落、代码、命令等(尽可能多)
-3. **UI元素**: 按钮、菜单、选项卡、输入框等
-4. **视觉细节**: 颜色、图标、布局风格
-5. **用户正在做什么**: 推测具体活动
-6. **其他细节**: 任何你能观察到的信息
+重点识别：
+1. **正在阅读或编辑的核心文字**: 提取代码片段、文档标题、正文内容、网页文章等可读信息。
+2. **用户意图**: 根据内容推测用户当下的具体工作或活动（如“正在修复Python缩进错误”、“正在阅读关于Transformer的论文”）。
 
-请用中文详细描述,不要遗漏细节。"""
+请用中文简练描述，展示你能看清多少细节。"""
                         },
                         {
                             "type": "image_url",
@@ -287,14 +467,47 @@ class SettingsDialog(QDialog):
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=500,  # 增加token限制以获取更详细的描述
+                # max_tokens=4096, # User requested no limit (or let model decide)
             )
             
+            # DEBUG OUTPUT
+            print(f"DEBUG: Full API Response: {response}")
+            
             result = response.choices[0].message.content
-            self.test_result_area.setText(f"✅ 分析成功!\n\n{result}")
+            
+            # Special handling for models that return thinking/reasoning process (e.g. some DeepSeek/GLM modes)
+            if not result and hasattr(response.choices[0].message, 'reasoning_content'):
+                # If content is empty but reasoning is present, show reasoning (or it might be simply truncated)
+                result = getattr(response.choices[0].message, 'reasoning_content', "")
+                if result:
+                    result = f"[Reasoning/Thinking Process]:\n{result}"
+
+            print(f"DEBUG: Extracted Content: {result}")
+
+            if not result:
+                result = f"⚠️ 警告: 返回内容为空。原始响应:\n{response}"
+
+            self.test_result_area.setText(f"✅ 分析成功 ({int(size_kb)}KB | {img.size[0]}x{img.size[1]}):\n\n{result}")
             
         except Exception as e:
             self.test_result_area.setText(f"❌ 测试失败:\n{str(e)}")
+
+    def on_provider_changed(self, index):
+        data = self.provider_combo.currentData()
+        
+        if data == "silicon":
+            self.base_url_input.setText("https://api.siliconflow.cn/v1")
+        elif data == "zhipu":
+            self.base_url_input.setText("https://open.bigmodel.cn/api/paas/v4")
+        elif data == "deepseek":
+            self.base_url_input.setText("https://api.deepseek.com")
+        elif data == "openai":
+            self.base_url_input.setText("https://api.openai.com/v1")
+        elif isinstance(data, dict):
+            # User preset
+            self.base_url_input.setText(data.get("base_url", ""))
+            self.api_key_input.setText(data.get("api_key", ""))
+            self.model_input.setCurrentText(data.get("model", ""))
 
     def test_connection(self):
         """保留原有的纯文本API测试功能(备用)"""
@@ -390,16 +603,41 @@ class SettingsDialog(QDialog):
         
         selected_monitor_idx = self.monitor_combo.currentData()
         self.settings.setValue(KEY_MONITOR_INDEX, selected_monitor_idx)
+
+        res_text = self.resolution_combo.currentText()
+        res_val = RESOLUTION_PRESETS.get(res_text, 1024)
+        self.settings.setValue(KEY_RESOLUTION, res_val)
         
         self.settings.setValue(KEY_REPORT_BASE_URL, self.report_base_url_input.text())
         self.settings.setValue(KEY_REPORT_API_KEY, self.report_api_key_input.text())
         self.settings.setValue(KEY_REPORT_MODEL, self.report_model_input.currentText())
         
+        # Save Provider Preset
+        self.settings.setValue(KEY_PROVIDER_PRESET, self.provider_combo.currentText())
+        
         self.accept()
+
+    def view_full_result(self):
+        content = self.test_result_area.toPlainText()
+        if not content:
+            return
+        
+        dlg = QDialog(self)
+        dlg.setWindowTitle("分析结果全文")
+        dlg.resize(800, 600)
+        vbox = QVBoxLayout()
+        text = QTextEdit()
+        text.setPlainText(content)
+        text.setReadOnly(True)
+        vbox.addWidget(text)
+        dlg.setLayout(vbox)
+        dlg.exec()
 
 class MonitorWorker(QThread):
     log_signal = Signal(str)
     status_signal = Signal(bool)
+    
+    # ... existing init ...
 
     def __init__(self):
         super().__init__()
@@ -421,34 +659,49 @@ class MonitorWorker(QThread):
             self.logger.error("API Key 未配置")
 
     def run(self):
-        self.sct = mss.mss()
-        self.running = True
-        self.status_signal.emit(True)
-        
-        interval = int(self.settings.value(KEY_INTERVAL, DEFAULT_INTERVAL))
-        self.logger.debug_mode = self.settings.value(KEY_DEBUG, False, type=bool)
-        
-        self._init_client()
-        monitor_idx = int(self.settings.value(KEY_MONITOR_INDEX, 1))
-        self.logger.info(f"监控已启动 - 间隔: {interval}秒 - 显示器: {monitor_idx}")
-
-        while self.running:
-            try:
-                self._process_cycle()
-            except Exception as e:
-                self.logger.error(f"循环异常: {str(e)}")
-                import traceback
-                self.logger.debug(traceback.format_exc())
+        try:
+            print("DEBUG: Worker execution started")
+            self.sct = mss.mss()
+            print("DEBUG: MSS initialized")
             
-            # Wait loop
+            self.running = True
+            self.status_signal.emit(True)
+            self.last_image = None # Reset
+            
             interval = int(self.settings.value(KEY_INTERVAL, DEFAULT_INTERVAL))
-            for _ in range(interval):
-                if not self.running:
-                    break
-                time.sleep(1)
-        
-        self.status_signal.emit(False)
-        self.logger.info("监控已停止")
+            self.logger.debug_mode = self.settings.value(KEY_DEBUG, False, type=bool)
+            
+            self._init_client()
+            monitor_idx = int(self.settings.value(KEY_MONITOR_INDEX, 1))
+            
+            display_mode = f"显示器 {monitor_idx}" if monitor_idx != -1 else "自动跟随活动窗口"
+            self.logger.info(f"监控已启动 - 间隔: {interval}秒 - 模式: {display_mode}")
+
+            while self.running:
+                try:
+                    self._process_cycle()
+                except Exception as e:
+                    self.logger.error(f"循环异常: {str(e)}")
+                    import traceback
+                    self.logger.debug(traceback.format_exc())
+                
+                # Wait loop
+                interval = int(self.settings.value(KEY_INTERVAL, DEFAULT_INTERVAL))
+                for _ in range(interval):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+            
+            self.status_signal.emit(False)
+            self.logger.info("监控已停止")
+            
+        except Exception as e:
+            print(f"DEBUG: Worker crashed: {e}")
+            self.logger.error(f"监控线程崩溃: {str(e)}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+            self.running = False
+            self.status_signal.emit(False)
 
     def stop(self):
         self.running = False
@@ -457,7 +710,16 @@ class MonitorWorker(QThread):
         self.logger.debug(">>> 开始新一轮监控循环")
         
         # 1. Capture
-        monitor_idx = int(self.settings.value(KEY_MONITOR_INDEX, 1))
+        setting_monitor_idx = int(self.settings.value(KEY_MONITOR_INDEX, 1))
+        
+        # Resolve Actual Monitor
+        if setting_monitor_idx == -1:
+            monitor_idx = get_active_monitor_index(self.sct, getattr(self, 'last_monitor_idx', 1))
+        else:
+            monitor_idx = setting_monitor_idx
+            
+        self.last_monitor_idx = monitor_idx # Cache for fallback
+        
         try:
             if monitor_idx >= len(self.sct.monitors):
                 self.logger.error(f"显示器索引 {monitor_idx} 超出范围，重置为 1")
@@ -470,8 +732,9 @@ class MonitorWorker(QThread):
             # Convert to PIL Image
             img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
             
-            # Resize (Thumbnail - Keep Aspect Ratio)
-            img.thumbnail(MAX_IMAGE_DIM, Image.Resampling.LANCZOS)
+            # Resize based on settings
+            target_res = int(self.settings.value(KEY_RESOLUTION, 1024))
+            img = resize_image(img, target_res)
             
             self.logger.debug(f"截图预处理完成. 尺寸: {img.size} 耗时: {time.time() - start_time:.2f}s")
         except Exception as e:
@@ -485,10 +748,16 @@ class MonitorWorker(QThread):
         # 2. Local Diff
         is_static = False
         if hasattr(self, 'last_image') and self.last_image:
-            diff_val = self._calculate_rms(self.last_image, img)
-            self.logger.debug(f"图像差异 RMS: {diff_val:.2f} (阈值: {DEFAULT_THRESHOLD})")
-            if diff_val < DEFAULT_THRESHOLD:
-                is_static = True
+            # Check size match properly
+            if self.last_image.size != img.size:
+                self.logger.debug(f"分辨率变化 ({self.last_image.size} -> {img.size})，强制分析")
+                # Treat as changed (not static), so we just fall through to analysis
+                is_static = False
+            else:
+                diff_val = self._calculate_rms(self.last_image, img)
+                self.logger.debug(f"图像差异 RMS: {diff_val:.2f} (阈值: {DEFAULT_THRESHOLD})")
+                if diff_val < DEFAULT_THRESHOLD:
+                    is_static = True
         else:
             self.logger.debug("首张图片，跳过对比")
         
@@ -516,12 +785,28 @@ class MonitorWorker(QThread):
         self.last_image = img
 
         # 4. Log
+        # Save Screenshot
+
+        try:
+            date_folder = datetime.datetime.now().strftime("%Y-%m-%d")
+            img_time_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            daily_folder = SCREENSHOT_DIR / date_folder
+            daily_folder.mkdir(exist_ok=True)
+            screenshot_path = daily_folder / f"{img_time_str}.jpg"
+            
+            img.save(screenshot_path, quality=85)
+            screenshot_path_str = str(screenshot_path)
+        except Exception as e:
+            self.logger.error(f"截图保存失败: {str(e)}")
+            screenshot_path_str = ""
+
         log_entry = {
             "timestamp": timestamp,
             "activity": activity,
             "window_title": window_info['title'],
             "process": window_info['process'],
-            "is_api_call": is_api_call
+            "is_api_call": is_api_call,
+            "screenshot": screenshot_path_str
         }
         self._save_log(log_entry)
         gc.collect()
@@ -585,9 +870,20 @@ class MonitorWorker(QThread):
         response = self.client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_tokens=80,  # 增加到80以支持50字中文输出
+            max_tokens=4096, # Increased to support reasoning models
         )
-        return response.choices[0].message.content.strip()
+        
+        result = response.choices[0].message.content
+        if not result and hasattr(response.choices[0].message, 'reasoning_content'):
+             # If content is empty but reasoning exists, try to use it or just log it
+             # For log, we prefer short summary, but better than nothing
+             reasoning = getattr(response.choices[0].message, 'reasoning_content', "")
+             # Try to extract the last part or just return "AI Thinking..."
+             # Or just return the first 50 chars of reasoning?
+             # Let's return the reasoning for now so user sees something is happening
+             return f"[Thinking] {reasoning[:50]}..."
+             
+        return result.strip() if result else ""
 
     def _save_log(self, entry):
         date_str = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -612,6 +908,84 @@ class ReportWindow(QDialog):
         layout.addWidget(close_btn)
         self.setLayout(layout)
 
+class SearchDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("搜索日志")
+        self.resize(800, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+        
+        # Search Bar
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("输入关键词搜索日志内容...")
+        self.search_input.returnPressed.connect(self.do_search)
+        search_layout.addWidget(self.search_input)
+        
+        search_btn = QPushButton("搜索")
+        search_btn.clicked.connect(self.do_search)
+        search_layout.addWidget(search_btn)
+        layout.addLayout(search_layout)
+        
+        # Results List
+        self.result_list = QListWidget()
+        self.result_list.itemDoubleClicked.connect(self.open_screenshot)
+        layout.addWidget(self.result_list)
+        
+        self.setLayout(layout)
+
+    def do_search(self):
+        keyword = self.search_input.text().strip()
+        if not keyword:
+            return
+            
+        self.result_list.clear()
+        
+        # Search in JSONL files
+        log_files = sorted(LOG_DIR.glob("daily_log_*.jsonl"), reverse=True)
+        results = []
+        
+        for log_file in log_files:
+            try:
+                with open(log_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            entry = json.loads(line)
+                            # Full text match construction
+                            content = f"{entry.get('activity', '')} {entry.get('window_title', '')} {entry.get('process', '')}"
+                            if keyword.lower() in content.lower():
+                                results.append(entry)
+                        except:
+                            continue
+            except:
+                continue
+                
+        # Display results
+        for entry in results:
+             text = f"[{entry['timestamp']}] {entry['activity']} - {entry.get('window_title', '')}"
+             item = QListWidgetItem(text)
+             item.setData(Qt.UserRole, entry.get('screenshot')) # Store screenshot path
+             self.result_list.addItem(item)
+             
+        if not results:
+             self.result_list.addItem("无搜索结果")
+
+    def open_screenshot(self, item):
+        path = item.data(Qt.UserRole)
+        if path and os.path.exists(path):
+            try:
+                os.startfile(path) # Windows only
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法打开截图: {e}")
+        else:
+            if path:
+                QMessageBox.information(self, "提示", f"截图文件已丢失: {path}")
+            else:
+                 QMessageBox.information(self, "提示", "该日志未关联截图")
+
 class AppWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -620,6 +994,14 @@ class AppWindow(QWidget):
         self.init_ui()
         self.init_tray()
         self.setup_connections()
+        self.load_custom_icon()
+
+    def load_custom_icon(self):
+        if ICON_PATH.exists():
+            icon = QIcon(str(ICON_PATH))
+            self.setWindowIcon(icon)
+            if hasattr(self, 'tray_icon'):
+                self.tray_icon.setIcon(icon)
 
     def init_ui(self):
         self.setWindowTitle("LumosLog - AI Screen Logger")
@@ -637,12 +1019,16 @@ class AppWindow(QWidget):
         settings_btn = QPushButton("设置 / API")
         settings_btn.clicked.connect(self.open_settings)
         header_layout.addWidget(settings_btn)
+
+        search_btn = QPushButton("🔍 搜索日志")
+        search_btn.clicked.connect(self.open_search)
+        header_layout.addWidget(search_btn)
         layout.addLayout(header_layout)
 
         # Control Row
         btn_layout = QHBoxLayout()
         self.toggle_btn = QPushButton("开始监控")
-        self.toggle_btn.setCheckable(True)
+        # self.toggle_btn.setCheckable(True) # Disable checkable to control state manually
         self.toggle_btn.clicked.connect(self.toggle_monitor)
         self.toggle_btn.setMinimumHeight(40)
         btn_layout.addWidget(self.toggle_btn)
@@ -675,15 +1061,23 @@ class AppWindow(QWidget):
 
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon))
+        if ICON_PATH.exists():
+            self.tray_icon.setIcon(QIcon(str(ICON_PATH)))
+        else:
+            self.tray_icon.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon))
         
         tray_menu = QMenu()
         show_action = QAction("显示主界面", self)
         show_action.triggered.connect(self.show_normal)
+        restart_action = QAction("⚡ 重启程序", self)
+        restart_action.triggered.connect(self.restart_app)
+        
         quit_action = QAction("退出程序", self)
         quit_action.triggered.connect(self.quit_app)
         
         tray_menu.addAction(show_action)
+        tray_menu.addAction(restart_action)
+        tray_menu.addSeparator()
         tray_menu.addAction(quit_action)
         
         self.tray_icon.setContextMenu(tray_menu)
@@ -701,6 +1095,11 @@ class AppWindow(QWidget):
             # Ideally restart worker if running to apply changes immediately
             if self.worker.running:
                 self.update_log("[INFO] 配置已保存，将在下一轮循环生效")
+            self.load_custom_icon() # Refresh icon immediately
+
+    def open_search(self):
+        dlg = SearchDialog(self)
+        dlg.exec()
 
     def toggle_debug(self, state):
         is_debug = (state == Qt.Checked.value) # Fix comparison for PySide6 enum or int
@@ -714,20 +1113,45 @@ class AppWindow(QWidget):
             self.update_log("[INFO] 调试模式已开启 - 将显示详细日志")
 
     def toggle_monitor(self):
-        if self.toggle_btn.isChecked():
-            # Check API key first
-            if not self.settings.value(KEY_API_KEY):
+        # Toggle based on actual worker intent
+        if not self.worker.isRunning():
+            # Start Monitor
+            api_key = self.settings.value(KEY_API_KEY)
+            
+            if not api_key:
                 QMessageBox.warning(self, "警告", "请先在设置中配置 API Key！")
-                self.toggle_btn.setChecked(False)
                 return
             
-            self.worker.start()
-            self.toggle_btn.setText("停止监控")
+            try:
+                self.worker.start()
+                self.toggle_btn.setText("停止监控")
+                self.toggle_btn.setStyleSheet("background-color: #ff4d4f; border: 1px solid #ff4d4f;")
+                self.update_log("[INFO] 正在启动监控...")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"启动失败: {str(e)}")
         else:
+            # Stop Monitor
             self.worker.stop()
             self.toggle_btn.setText("开始监控")
+            self.toggle_btn.setStyleSheet("")
+            self.update_log("[INFO]正在停止监控...")
 
     def update_log(self, text):
+        import html
+        # Escape HTML to prevent tag rendering issues and ensure special chars like < > are visible
+        # Check if text is already HTML formatted (contains <font ...)? 
+        # LogManager uses <font color='red'> for errors.
+        # We should only escape if it's NOT a formatted error, or handle specifically.
+        
+        # Simple heuristic: if it contains <font, assume it's pre-formatted safely by us.
+        # Otherwise escape.
+        if "<font" in text:
+            # It's likely our own formatted error. 
+            pass 
+        else:
+            # Escape content to treat as plain text
+            text = html.escape(text)
+            
         self.log_display.append(text)
         sb = self.log_display.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -881,20 +1305,35 @@ class AppWindow(QWidget):
 
 
     def closeEvent(self, event: QCloseEvent):
-        if self.tray_icon.isVisible():
-            self.hide()
-            self.tray_icon.showMessage("LumosLog", "程序已最小化到托盘", QSystemTrayIcon.Information, 2000)
-            event.ignore()
-        else:
-            event.accept()
+        # 恢复关闭按钮的原始含义：退出程序
+        self.quit_app()
+        event.accept()
+
+    def changeEvent(self, event):
+        # 只有点击最小化时，才缩小到托盘（隐藏窗口）
+        if event.type() == QEvent.WindowStateChange:
+            if self.windowState() & Qt.WindowMinimized:
+                event.accept()
+                QTimer.singleShot(0, self.hide)
+                return
+        super().changeEvent(event)
 
     def show_normal(self):
         self.show()
+        self.setWindowState(Qt.WindowActive)
         self.activateWindow()
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
             self.show_normal()
+
+    def restart_app(self):
+        """重启应用程序"""
+        self.worker.stop()
+        self.tray_icon.hide()
+        QApplication.quit()
+        # Relaunch
+        subprocess.Popen([sys.executable] + sys.argv)
 
     def quit_app(self):
         self.worker.stop()
