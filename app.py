@@ -1194,6 +1194,9 @@ class AppWindow(QWidget):
             start_time = current['timestamp']
             end_time = start_time
             
+            # 收集所有相似活动的描述
+            activities = [current['activity']]
+            
             # 向前查找相似活动
             j = i + 1
             similar_count = 0
@@ -1202,15 +1205,19 @@ class AppWindow(QWidget):
                 # 判断活动是否相似（窗口相同 + 活动描述相似度高）
                 if (self._is_similar_activity(current, next_log)):
                     end_time = next_log['timestamp']
+                    activities.append(next_log['activity'])
                     similar_count += 1
                     j += 1
                 else:
                     break
             
+            # 合并活动描述
+            merged_activity = self._merge_activities(activities) if similar_count > 0 else current['activity']
+            
             # 创建压缩后的日志条目
             merged_log = {
                 'timestamp': f"{start_time} - {end_time}" if similar_count > 0 else start_time,
-                'activity': current['activity'],
+                'activity': merged_activity,
                 'window_title': current.get('window_title', 'Unknown'),
                 'process': current.get('process', 'Unknown'),
                 'duration_minutes': similar_count # 持续分钟数（粗略估计）
@@ -1234,6 +1241,40 @@ class AppWindow(QWidget):
         self.log_display.append(f"[INFO] ━━━━━━━━━━━━━━━━━━")
         
         return compressed
+    
+    def _merge_activities(self, activities):
+        """合并多条相似活动的描述,去除重复部分,保留差异信息"""
+        if len(activities) == 1:
+            return activities[0]
+        
+        # 找出共同前缀
+        common_prefix = ""
+        first_parts = activities[0].split(' - ', 1)
+        if len(first_parts) > 1 and all(' - ' in act for act in activities):
+            # 检查是否所有活动都有相同的前缀部分
+            prefix_candidate = first_parts[0]
+            if all(act.startswith(prefix_candidate) for act in activities):
+                common_prefix = prefix_candidate + ' - '
+        
+        # 提取差异部分
+        details = []
+        for act in activities:
+            if common_prefix:
+                detail = act[len(common_prefix):].strip()
+            else:
+                # 如果没有共同前缀,尝试提取' - '后的部分
+                parts = act.split(' - ', 1)
+                detail = parts[1] if len(parts) > 1 else act
+            
+            # 去重
+            if detail and detail not in details:
+                details.append(detail)
+        
+        # 合并结果
+        if common_prefix:
+            return common_prefix + '; '.join(details)
+        else:
+            return activities[0].split(' - ')[0] + ' - ' + '; '.join(details) if details else activities[0]
     
     def _is_similar_activity(self, log1, log2):
         """判断两个日志条目是否为相似活动"""
